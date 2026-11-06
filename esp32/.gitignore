@@ -42,6 +42,10 @@ eim_config.toml
 release_signing_key.pem
 factory_test_signing_key.pem
 
+# Akari voice endpoint and token — provisioned per build machine from
+# akari_tts_secrets.example.h, never committed.
+components/muse/akari_tts_secrets.h
+
 .DS_Store
 
 # Python test bytecode
