@@ -433,6 +433,25 @@ menu "Muse"
             them. Needs PSRAM. Without it, voice notes go over Home Link's own
             session to its paired VM and replies are shown as text.
 
+    config MUSE_AKARI_TTS
+        bool "Speak replies with a VOICEVOX TTS endpoint (Akari voice)"
+        depends on MUSE_HATCH
+        default n
+        help
+            When the device's Speaker setting is on, a finished reply is
+            spoken by an external VOICEVOX endpoint instead of only being
+            shown at reading pace: the reply text is synthesized sentence
+            by sentence (style id 17, speedScale 1.15) and played on the
+            speaker, captions following the speech. Speaker off means no
+            request is made and replies are shown, as stock.
+
+            The endpoint URL and its Bearer token are not part of the
+            source tree: they are read from the gitignored header
+            components/muse/akari_tts_secrets.h (copy
+            akari_tts_secrets.example.h and fill it in on the build
+            machine). Without the header the option compiles but stays
+            inert. See docs/akari-voicevox-tts.md.
+
     config MUSE_REALTIME_VOICE
         bool "Live voice calls with Muse (experimental)"
         depends on (MUSE_HATCH || HOMEHUB_VOICE) && SPIRAM

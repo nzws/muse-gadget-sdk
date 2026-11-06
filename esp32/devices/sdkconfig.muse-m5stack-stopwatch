@@ -69,3 +69,7 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # actually slept, and how long each power lock kept the chip awake.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
+
+# Akari voice: speak replies with a VOICEVOX TTS endpoint (docs/akari-voicevox-tts.md).
+# Inert until akari_tts_secrets.h is provisioned on the build machine.
+CONFIG_MUSE_AKARI_TTS=y
