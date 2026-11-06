@@ -20,10 +20,20 @@ plugging in a TTS API of your own. This feature takes that hook:
    punctuation mark) and, per sentence, calls the endpoint:
    `POST /audio_query?text=…&speaker=17`, tunes the returned query
    (`speedScale` 1.15, `outputSamplingRate` 16000, mono), then
-   `POST /synthesis?speaker=17`. Style id 17 is the chosen voice.
-3. The WAV that comes back is converted to 16 kHz mono PCM16 and
-   streamed into the session's reply buffer, so the existing playback
-   and caption pacing work unchanged: captions follow the speech.
+   `POST /streaming_synthesis?speaker=17`. Style id 17 is the chosen
+   voice. The query is always computed for the complete sentence, so
+   intonation stays natural; only the audio delivery is streamed.
+3. The response is one WAV (44-byte header, then raw PCM) delivered
+   in bursts of ~0.25 s of audio as the engine generates it. The
+   firmware parses the header incrementally and converts the PCM to
+   16 kHz mono PCM16 as it arrives, feeding the session's reply
+   buffer, so speech starts with the first chunk instead of after
+   the whole sentence — and the existing playback and caption pacing
+   work unchanged: captions follow the speech. Because the engine
+   generates streaming audio at only ~1.05x real time on the host
+   CPU, the session's drain of each message holds back the first
+   0.75 s of speech as a cushion against jitter (released early
+   when synthesis ends, e.g. for very short replies).
 4. Any failure (no network, HTTP error, malformed audio) flips the
    message back to silence pacing for its remainder. A TTS outage can
    delay speech; it can never break a turn.
@@ -49,8 +59,8 @@ reach the firmware through a gitignored header:
 
 1. Copy `components/muse/akari_tts_secrets.example.h` to
    `components/muse/akari_tts_secrets.h` (same directory).
-2. Fill in `AKARI_TTS_URL` (base URL; `/audio_query` and `/synthesis`
-   are appended) and `AKARI_TTS_TOKEN`.
+2. Fill in `AKARI_TTS_URL` (base URL; `/audio_query` and
+   `/streaming_synthesis` are appended) and `AKARI_TTS_TOKEN`.
 3. Rebuild and flash as usual (`tools/muse/board.sh build stopwatch`).
 
 Without the header, or with empty values, `akari_tts_configured()` is

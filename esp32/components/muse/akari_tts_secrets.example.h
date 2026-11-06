@@ -22,7 +22,7 @@
  * reading pace, as in stock firmware.
  *
  *   AKARI_TTS_URL    Base URL of the VOICEVOX endpoint, HTTPS, no path:
- *                    the firmware appends /audio_query and /synthesis.
+ *                    the firmware appends /audio_query and /streaming_synthesis.
  *   AKARI_TTS_TOKEN  Bearer token the endpoint expects, sent as the
  *                    Authorization header of every request.
  */

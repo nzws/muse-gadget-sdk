@@ -36,12 +36,18 @@ extern "C" {
  *
  * Flow: akari_tts_start() hands a message's text to a dedicated task,
  * which splits it into sentences and, per sentence, runs the VOICEVOX
- * /audio_query + /synthesis pair over HTTPS. Synthesized speech arrives
- * as 16 kHz mono PCM16; the chat session drains it with akari_tts_read()
- * into its reply stream, so captions stay paced to the speech. Any
- * failure is reported through akari_tts_failed() and the session falls
- * back to reading pace for the rest of the message: a TTS outage never
- * breaks a turn.
+ * /audio_query + /streaming_synthesis pair over HTTPS: the query is
+ * still computed for the complete sentence (so intonation stays
+ * natural), but the audio streams back and is fed to the session as
+ * it arrives, so speech starts with the first chunk instead of after
+ * the whole sentence has synthesized. A short prebuffer (0.75 s of
+ * speech, released early when synthesis ends) cushions playback
+ * against the engine's near-real-time generation rate. Synthesized
+ * speech is 16 kHz mono PCM16; the chat session drains it with
+ * akari_tts_read() into its reply stream, so captions stay paced to
+ * the speech. Any failure is reported through akari_tts_failed() and
+ * the session falls back to reading pace for the rest of the message:
+ * a TTS outage never breaks a turn.
  */
 
 /* True when an endpoint URL and token were provisioned at build time. */
