@@ -78,6 +78,9 @@ extern "C" {
 }
 #include "muse_chat_priv.h"
 #include "sdkconfig.h"
+#if CONFIG_MUSE_AKARI_TTS
+#include "akari_tts.h"
+#endif
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call_priv.h"
 #endif
@@ -266,6 +269,7 @@ struct turn_t {
     /* TTS */
     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
+    bool pcm_tts;            /* Akari voice: tts_msg is fed PCM by akari_tts, not MP3 */
     uint8_t *mp3;            /* MP3_BUF */
     size_t mp3_len;
     bool mp3_ended;
@@ -1000,7 +1004,11 @@ static void turn_finish(void)
     s_turn.dict_id = s_turn.chat_id = 0;
     s_turn.tts_msg = -1;
     s_turn.silent = false;
+    s_turn.pcm_tts = false;
     s_turn.mp3_len = 0;
+#if CONFIG_MUSE_AKARI_TTS
+    akari_tts_abort();
+#endif
 }
 
 static void turn_fail(const char *why)
@@ -1608,6 +1616,34 @@ static void start_tts(void)
          * end. decode() plays it at the speaker's volume, captions following,
          * and finishes the message once it's drained.
          */
+        /*
+         * Akari voice: with the speaker on and a TTS endpoint provisioned
+         * (akari_tts_secrets.h), the message is spoken instead of paced:
+         * akari_tts synthesizes it sentence by sentence on its own task
+         * and decode() drains the PCM it produces. Any failure flips the
+         * message back to the silence pacing below (see decode()).
+         */
+#if CONFIG_MUSE_AKARI_TTS
+        if (muse_settings_speaker_on() && s_turn.texts && akari_tts_configured()) {
+            const char *text = s_turn.texts + i * TEXT_MAX;
+            if (text[0] && akari_tts_start(text)) {
+                m.pcm_start = s_turn.pcm_out;
+                m.pcm_frames = 0;
+                m.tts = TTS_ACTIVE;
+                s_turn.tts_msg = i;
+                s_turn.silent = false;
+                s_turn.pcm_tts = true;
+                s_turn.mp3_len = 0;
+                s_turn.mp3_ended = false;
+                s_turn.kbps = 0;
+                s_turn.down_rate = 0;
+                mp3dec_init(&s_turn.dec);
+                ESP_LOGI(TAG, "speaking message %s with the Akari voice", m.id);
+                show_reply_start(m);
+                return;
+            }
+        }
+#endif
         m.pcm_start = s_turn.pcm_out;
         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
          * was kept at reading pace, not stretched over the whole reply's time
@@ -1667,6 +1703,49 @@ static void pace_silently(void)
     }
 }
 
+#if CONFIG_MUSE_AKARI_TTS
+/*
+ * Drains synthesized speech from akari_tts into the reply buffer while
+ * the current message is being spoken. A failed fetch flips the message
+ * back to reading pace for whatever has not been spoken yet, so the
+ * captions still finish the message.
+ */
+static void akari_pcm_decode(void)
+{
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    for (;;) {
+        size_t space = xStreamBufferSpacesAvailable(s_out) / sizeof(int16_t);
+        if (!space) {
+            break;
+        }
+        size_t want = space < 1024 ? space : 1024;
+        size_t n = akari_tts_read(s_pcm, want);
+        if (!n) {
+            break;
+        }
+        xStreamBufferSend(s_out, s_pcm, n * sizeof(int16_t), 0);
+        s_turn.pcm_out += n;
+        mark(M_AUDIO);
+    }
+    if (akari_tts_failed()) {
+        size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + s_turn.tts_msg * TEXT_MAX) : m.len;
+        uint32_t paced = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+        uint32_t spoken = s_turn.pcm_out - m.pcm_start;
+        m.pcm_frames = paced > spoken ? paced : spoken;
+        s_turn.pcm_tts = false;
+        s_turn.silent = true;
+        ESP_LOGW(TAG, "Akari voice failed; showing the rest at reading pace");
+        return;
+    }
+    if (akari_tts_ended() && !akari_tts_available()) {
+        m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+        m.tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+        s_turn.pcm_tts = false;
+    }
+}
+#endif
+
 /* Decodes buffered MP3 while the reply buffer has room. */
 static void decode(void)
 {
@@ -1677,6 +1756,12 @@ static void decode(void)
         pace_silently();
         return;
     }
+#if CONFIG_MUSE_AKARI_TTS
+    if (s_turn.pcm_tts) {
+        akari_pcm_decode();
+        return;
+    }
+#endif
     /*
      * minimp3 only takes a frame once it can see the next one's header. Given
      * less, it resets and says to skip all of it, which drops speech and clicks.
