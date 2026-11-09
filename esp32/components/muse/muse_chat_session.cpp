@@ -81,6 +81,7 @@ extern "C" {
 #if CONFIG_MUSE_AKARI_TTS
 #include "akari_tts.h"
 #endif
+#include "akari_history.h"
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call_priv.h"
 #endif
@@ -1271,6 +1272,7 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
+    akari_history_add(true, text);   /* the final utterance, for the history page */
     send_chat(text, "text", true);
 }
 
@@ -1462,6 +1464,14 @@ static void message_done(int i, const char *final_text)
         : m.len && s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
     muse_review_store(s_turn.review, review);
 #endif
+    /* Akari history: the finished reply, for the history page. Resolved
+     * like the review text above, and placed ahead of the s_turn.text
+     * early return below so both of this function's paths record it. */
+    const char *history_text = final_text && final_text[0] ? final_text
+        : m.len && s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
+    if (history_text && history_text[0]) {
+        akari_history_add(false, history_text);
+    }
     if (s_turn.text) {
         /* The whole text if the pieces didn't add up to it (a line skipped, say): the reader uses it instead. */
         size_t n = m.len;

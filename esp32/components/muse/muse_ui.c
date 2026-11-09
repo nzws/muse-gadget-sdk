@@ -31,6 +31,7 @@
 #include "src/draw/lv_image_decoder_private.h"   /* custom decoder */
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
+#include "akari_history.h"
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_input.h"
@@ -111,6 +112,14 @@ static bool s_touch_talk_down;
  * read from any task (single word, benign if briefly stale). */
 static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
+/* Akari history page: a tile between the face and Settings where the
+ * finished turns can be read back (akari_history.c keeps them). */
+static lv_obj_t *s_history;
+static lv_obj_t *s_history_scroll;   /* the page's vertically scrolling body */
+static lv_obj_t *s_history_lbl;      /* its one wrapped label */
+static unsigned s_history_seen;      /* akari_history_version() as last rendered */
+
+static void refresh_history(void);
 
 static void update_tileview_swipe(void)
 {
@@ -125,6 +134,24 @@ static void tile_changed_cb(lv_event_t *e)
 {
     lv_obj_t *tv = lv_event_get_target(e);
     s_face_active = (lv_tileview_get_tile_active(tv) == s_face);
+    if (s_history && lv_tileview_get_tile_active(tv) == s_history) {
+        refresh_history();   /* show the turns as they now stand */
+    }
+}
+
+/* Rebuilds the history page's text from the store and shows its end,
+ * the newest turn. Only the LVGL task calls this. */
+static void refresh_history(void)
+{
+    if (!s_history_lbl) {
+        return;
+    }
+    char *text = akari_history_render();
+    lv_label_set_text(s_history_lbl, text && text[0] ? text : "まだ会話履歴がありません");
+    free(text);
+    s_history_seen = akari_history_version();
+    lv_obj_update_layout(s_history_scroll);
+    lv_obj_scroll_to_y(s_history_scroll, LV_COORD_MAX, LV_ANIM_OFF);
 }
 
 /* From any task: the face tile is the currently visible tile. */
@@ -133,7 +160,7 @@ bool muse_ui_face_active(void)
     return s_face_active;
 }
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[2];
+static lv_obj_t *s_dots[3];
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -1121,6 +1148,40 @@ static void apply_text_size(void)
 }
 #endif
 
+#define HISTORY_INSET 28      /* the label's clear space at the round screen's sides */
+#define HISTORY_EDGE_PAD 24   /* and above the first / below the last turn */
+
+/* The history tile's content: one wrapped label in a body that scrolls
+ * up and down inside the tile. A vertical drag scrolls the body; a
+ * horizontal one cannot (its scroll direction is vertical), so LVGL
+ * chains it to the tileview and the swipe still turns the tile. The
+ * label is inset and padded at the ends: the round screen's corners
+ * curve away from the corners of the page. */
+static void build_history_page(void)
+{
+    lv_obj_set_scrollbar_mode(s_history, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_color(s_history, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_history, LV_OPA_COVER, 0);
+
+    s_history_scroll = lv_obj_create(s_history);
+    lv_obj_remove_style_all(s_history_scroll);
+    lv_obj_set_size(s_history_scroll, lv_pct(100), lv_pct(100));
+    lv_obj_set_scroll_dir(s_history_scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_history_scroll, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_left(s_history_scroll, HISTORY_INSET, 0);
+    lv_obj_set_style_pad_right(s_history_scroll, HISTORY_INSET, 0);
+    lv_obj_set_style_pad_top(s_history_scroll, HISTORY_EDGE_PAD, 0);
+    lv_obj_set_style_pad_bottom(s_history_scroll, HISTORY_EDGE_PAD, 0);
+
+    s_history_lbl = make_label(s_history_scroll, caption_font(), COLOR_LIT);
+    lv_obj_set_style_text_align(s_history_lbl, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_line_space(s_history_lbl, 4, 0);
+    lv_label_set_long_mode(s_history_lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(s_history_lbl, s_w - 2 * HISTORY_INSET);
+    lv_obj_remove_flag(s_history_lbl, LV_OBJ_FLAG_SCROLLABLE);
+    refresh_history();
+}
+
 static void build_screen(void)
 {
 #if CONFIG_MUSE_LATIN_FONT
@@ -1146,8 +1207,10 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
-        s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+        s_history = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+        s_settings = lv_tileview_add_tile(s_tv, 2, 0, LV_DIR_LEFT);
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        build_history_page();
         face = s_face;
     }
 
@@ -1459,11 +1522,12 @@ static lv_obj_t *make_control_icon(lv_obj_t *scr, const muse_button_hint_t *pos,
 static void update_control_hints(muse_mode_t mode)
 {
     if (!s_ptt_hint) return;
-    /* Don't obscure settings rows/keyboards with floating physical icons. */
-    bool settings = s_tv && lv_tileview_get_tile_active(s_tv) == s_settings;
-    lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
-    lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
-    lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
+    /* Don't obscure settings rows/keyboards, or the history page's
+     * text, with floating physical icons. */
+    bool off_face = s_tv && lv_tileview_get_tile_active(s_tv) != s_face;
+    lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, off_face);
+    lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, off_face);
+    lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, off_face);
     static int last_mode = -1;
     if ((int)mode != last_mode) {
         color_mic(s_ptt_hint, mode == MUSE_MODE_LISTENING ? 0x64d4ff : 0x80bfff);
@@ -1482,7 +1546,7 @@ static void build_overlays(void)
     lv_obj_t *scr = lv_screen_active();
 
     /* Page dots. */
-    for (int i = 0; i < 2 && s_tv; i++) {
+    for (int i = 0; i < 3 && s_tv; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1490,7 +1554,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, i ? 8 : -8, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (i - 1) * 16, -14);
         s_dots[i] = d;
     }
 
@@ -1661,19 +1725,23 @@ static void update_chrome(float now)
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
     if (s_tv) {
-        int page = lv_tileview_get_tile_active(s_tv) == s_settings;
+        lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
+        int page = active == s_settings ? 2 : active == s_history ? 1 : 0;
         bool subpage = muse_settings_ui_in_subpage();
-        s_swipe_enabled = !page || !subpage;
+        s_swipe_enabled = page != 2 || !subpage;
         update_tileview_swipe();
         int shown = page * 2 + subpage;
         if (shown != s_shown_page) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page && subpage);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page == 2 && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > 0);
+        muse_settings_ui_tick(page == 2);
+        if (page == 1 && akari_history_version() != s_history_seen) {
+            refresh_history();   /* a turn finished while the page is up */
+        }
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -1868,9 +1936,9 @@ static void update_status(muse_mode_t mode, float now)
     const char *hint = muse_voice_call_hint();
     if (call_name) name = call_name;
     if (s_talk_hint_lbl) {
-        /* Hidden over the settings rows, as the rim icons are, and once the
+        /* Hidden off the face, as the rim icons are, and once the
          * call is ending (an empty hint). */
-        bool show = hint && hint[0] && !(s_tv && lv_tileview_get_tile_active(s_tv) == s_settings);
+        bool show = hint && hint[0] && !(s_tv && lv_tileview_get_tile_active(s_tv) != s_face);
         lv_obj_set_flag(s_talk_hint_lbl, LV_OBJ_FLAG_HIDDEN, !show);
         lv_obj_set_flag(s_end_hint_lbl, LV_OBJ_FLAG_HIDDEN, !show);
         if (show && strcmp(lv_label_get_text(s_talk_hint_lbl), hint)) {
