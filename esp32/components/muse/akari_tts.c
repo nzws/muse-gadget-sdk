@@ -61,9 +61,11 @@ static const char *TAG = "akari_tts";
  * Speech held back before the session may start draining a message.
  * The engine generates streaming audio at only ~1.05x real time on the
  * host CPU, so starting playback the instant the first bytes land
- * leaves no cushion against network jitter; 0.75 s of head start does.
+ * leaves no cushion against network jitter; 0.5 s of head start does
+ * (about ten seconds of catch-up runway at that rate, far longer
+ * than a sentence).
  */
-#define PREBUF_FRAMES (AKARI_RATE * 3 / 4)
+#define PREBUF_FRAMES (AKARI_RATE / 2)
 /* One sentence's audio_query answer, capped against a broken server. */
 #define QUERY_MAX (256 * 1024)
 /* One sentence's streamed audio, capped the same way (~2 min of speech). */
@@ -148,35 +150,114 @@ typedef struct {
     bool overflow;
 } body_t;
 
-static esp_err_t body_event(esp_http_client_event_t *evt)
+/*
+ * One client for the whole TTS task, kept across requests: a reply's
+ * query, its synthesis calls and the next reply reuse the connection
+ * instead of paying a fresh TLS handshake every time. The invariant
+ * is that the client is only kept after a response has been read to
+ * the end; any transport failure drops it, and the caller retries
+ * once on a fresh client (which is also how a connection the server
+ * closed while idle is recovered). Only the HTTP status is ever
+ * logged: the URL and the Authorization header stay out of the logs.
+ */
+static esp_http_client_handle_t s_client;
+
+/* Where response data goes while a request runs (TTS task only). */
+static body_t *s_collect;   /* set: append the whole body (query) */
+static bool (*s_data_cb)(const uint8_t *data, size_t len, void *ctx);
+static void *s_data_ctx;    /* set: feed chunks as they land (synthesis) */
+
+static esp_err_t http_event(esp_http_client_event_t *evt)
 {
-    body_t *b = evt->user_data;
     if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->data_len) {
         return ESP_OK;
     }
-    if (b->len + evt->data_len > b->max) {
-        b->overflow = true;
-        return ESP_FAIL;
-    }
-    if (b->len + evt->data_len > b->cap) {
-        size_t cap = (b->len + evt->data_len) * 2;
-        uint8_t *grown = heap_caps_realloc(b->data, cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!grown) {
+    if (s_collect) {
+        body_t *b = s_collect;
+        if (b->len + (size_t)evt->data_len > b->max) {
+            b->overflow = true;
             return ESP_FAIL;
         }
-        b->data = grown;
-        b->cap = cap;
+        if (b->len + (size_t)evt->data_len > b->cap) {
+            size_t cap = (b->len + (size_t)evt->data_len) * 2;
+            uint8_t *grown = heap_caps_realloc(b->data, cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!grown) {
+                return ESP_FAIL;
+            }
+            b->data = grown;
+            b->cap = cap;
+        }
+        memcpy(b->data + b->len, evt->data, (size_t)evt->data_len);
+        b->len += (size_t)evt->data_len;
+        return ESP_OK;
     }
-    memcpy(b->data + b->len, evt->data, evt->data_len);
-    b->len += evt->data_len;
+    if (s_data_cb) {
+        return s_data_cb(evt->data, (size_t)evt->data_len, s_data_ctx)
+                   ? ESP_OK
+                   : ESP_FAIL;
+    }
     return ESP_OK;
+}
+
+static void http_drop_client(void)
+{
+    if (s_client) {
+        esp_http_client_cleanup(s_client);
+        s_client = NULL;
+    }
+}
+
+static bool http_ensure_client(void)
+{
+    if (s_client) {
+        return true;
+    }
+    char base[192];
+    base_url(base, sizeof(base));
+    esp_http_client_config_t cfg = {
+        .url = base,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 20000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = http_event,
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
+        .keep_alive_enable = true,
+    };
+    s_client = esp_http_client_init(&cfg);
+    return s_client != NULL;
+}
+
+/*
+ * One POST on the shared client. Returns the HTTP status once the
+ * exchange completed (any status), or -1 on a transport failure, in
+ * which case the client has been dropped and a retry starts fresh.
+ */
+static int http_do(const char *url, const char *payload, size_t payload_len)
+{
+    if (!http_ensure_client()) {
+        return -1;
+    }
+    char auth[32 + sizeof(AKARI_TTS_TOKEN)];
+    snprintf(auth, sizeof(auth), "Bearer %s", AKARI_TTS_TOKEN);
+    esp_http_client_set_url(s_client, url);
+    esp_http_client_set_method(s_client, HTTP_METHOD_POST);
+    /* Post field first: setting it can touch Content-Type, so the
+     * explicit headers below must come after it. */
+    esp_http_client_set_post_field(s_client, payload, (int)payload_len);
+    esp_http_client_set_header(s_client, "Authorization", auth);
+    esp_http_client_set_header(s_client, "Content-Type", "application/json");
+    esp_err_t err = esp_http_client_perform(s_client);
+    if (err != ESP_OK) {
+        http_drop_client();
+        return -1;
+    }
+    return esp_http_client_get_status_code(s_client);
 }
 
 /*
  * One POST to the TTS endpoint. `path` carries path + query. The whole
- * response lands in `body` (caller frees body->data). Only the HTTP
- * status is ever logged: the URL and the Authorization header stay out
- * of the logs.
+ * response lands in `body` (caller frees body->data).
  */
 static bool http_post(const char *path, const char *payload, size_t payload_len, body_t *body)
 {
@@ -189,40 +270,26 @@ static bool http_post(const char *path, const char *payload, size_t payload_len,
     strcpy(url, base);
     strcat(url, path);
 
-    char auth[32 + sizeof(AKARI_TTS_TOKEN)];
-    snprintf(auth, sizeof(auth), "Bearer %s", AKARI_TTS_TOKEN);
-
-    /* Reset the collection, keeping the caller's size cap. */
-    body->data = NULL;
-    body->len = 0;
-    body->cap = 0;
-    body->overflow = false;
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 20000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .event_handler = body_event,
-        .user_data = body,
-        .buffer_size = 4096,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    bool ok = false;
-    if (client) {
-        esp_http_client_set_header(client, "Authorization", auth);
-        if (payload) {
-            esp_http_client_set_header(client, "Content-Type", "application/json");
-            esp_http_client_set_post_field(client, payload, payload_len);
+    int status = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        /* Reset the collection, keeping the caller's size cap. */
+        free(body->data);
+        body->data = NULL;
+        body->len = 0;
+        body->cap = 0;
+        body->overflow = false;
+        s_collect = body;
+        status = http_do(url, payload, payload_len);
+        s_collect = NULL;
+        if (status >= 0 || body->overflow) {
+            break;
         }
-        esp_err_t err = esp_http_client_perform(client);
-        int status = esp_http_client_get_status_code(client);
-        ok = err == ESP_OK && status == 200 && !body->overflow && body->data;
-        if (!ok) {
-            ESP_LOGW(TAG, "TTS request failed (status %d)", status);
-        }
-        esp_http_client_cleanup(client);
     }
     free(url);
+    bool ok = status == 200 && !body->overflow && body->data;
+    if (!ok && status > 0) {
+        ESP_LOGW(TAG, "TTS request failed (status %d)", status);
+    }
     return ok;
 }
 
@@ -442,6 +509,58 @@ static long wav_prefix(const uint8_t *buf, size_t len, pcm_sink_t *s)
  * already queued still plays). As everywhere here, only the HTTP
  * status is logged — never the URL or the Authorization header.
  */
+/* The synthesis stream's state, fed chunk by chunk from http_event. */
+typedef struct {
+    uint32_t gen;
+    pcm_sink_t sink;
+    uint8_t prefix[WAV_PREFIX_MAX];
+    size_t prefix_len;
+    bool in_data;
+    size_t total;
+} stream_ctx_t;
+
+static bool stream_feed(const uint8_t *p, size_t n, void *vctx)
+{
+    stream_ctx_t *ctx = vctx;
+    if (ctx->gen != s_gen) {
+        return false;
+    }
+    ctx->total += n;
+    if (ctx->total > STREAM_MAX_BYTES) {
+        return false;
+    }
+    if (!ctx->in_data) {
+        size_t take = sizeof(ctx->prefix) - ctx->prefix_len;
+        if (take > n) {
+            take = n;
+        }
+        memcpy(ctx->prefix + ctx->prefix_len, p, take);
+        ctx->prefix_len += take;
+        long used = wav_prefix(ctx->prefix, ctx->prefix_len, &ctx->sink);
+        if (used == -1) {
+            /* More header is needed; fail if this chunk had bytes the
+             * prefix could not hold (they would be lost). */
+            return take == n;
+        }
+        if (used < 0) {
+            return false;
+        }
+        ctx->in_data = true;
+        /* PCM that arrived with the header, then this chunk's bytes
+         * beyond what the prefix copied. */
+        if (!sink_bytes(ctx->gen, &ctx->sink, ctx->prefix + used,
+                        ctx->prefix_len - (size_t)used)) {
+            return false;
+        }
+        p += take;
+        n -= take;
+        if (!n) {
+            return true;
+        }
+    }
+    return sink_bytes(ctx->gen, &ctx->sink, p, n);
+}
+
 static bool stream_synthesis(uint32_t gen, const char *payload)
 {
     char base[192];
@@ -457,117 +576,33 @@ static bool stream_synthesis(uint32_t gen, const char *payload)
     snprintf(id, sizeof(id), "%d", AKARI_SPEAKER_ID);
     strcat(url, id);
 
-    char auth[32 + sizeof(AKARI_TTS_TOKEN)];
-    snprintf(auth, sizeof(auth), "Bearer %s", AKARI_TTS_TOKEN);
-
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 20000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size = 4096,
-        .buffer_size_tx = 4096,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    bool ok = false;
-    if (client) {
-        size_t payload_len = strlen(payload);
-        esp_http_client_set_header(client, "Authorization", auth);
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        if (esp_http_client_open(client, payload_len) == ESP_OK) {
-            size_t written = 0;
-            while (written < payload_len) {
-                int w = esp_http_client_write(client, payload + written,
-                                              payload_len - written);
-                if (w <= 0) {
-                    break;
-                }
-                written += (size_t)w;
-            }
-            if (written == payload_len &&
-                esp_http_client_fetch_headers(client) >= 0) {
-                int status = esp_http_client_get_status_code(client);
-                if (status != 200) {
-                    ESP_LOGW(TAG, "TTS request failed (status %d)", status);
-                } else {
-                    ok = true;
-                }
-            }
+    int status = -1;
+    stream_ctx_t ctx;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.gen = gen;
+        ctx.sink.channels = 1;
+        s_data_cb = stream_feed;
+        s_data_ctx = &ctx;
+        status = http_do(url, payload, strlen(payload));
+        s_data_cb = NULL;
+        s_data_ctx = NULL;
+        /* A retry is only safe before any audio was consumed. */
+        if (status >= 0 || ctx.in_data || ctx.total > 0) {
+            break;
         }
-        if (ok) {
-            pcm_sink_t sink = { .channels = 1, .rate = 0 };
-            uint8_t prefix[WAV_PREFIX_MAX];
-            size_t prefix_len = 0;
-            bool in_data = false;
-            size_t total = 0;
-            uint8_t buf[2048];
-            while (ok) {
-                if (gen != s_gen) {
-                    ok = false;
-                    break;
-                }
-                int r = esp_http_client_read(client, (char *)buf, sizeof(buf));
-                if (r < 0) {
-                    ok = false;
-                    break;
-                }
-                if (r == 0) {
-                    break;   /* end of the stream */
-                }
-                total += (size_t)r;
-                if (total > STREAM_MAX_BYTES) {
-                    ok = false;
-                    break;
-                }
-                const uint8_t *p = buf;
-                size_t n = (size_t)r;
-                if (!in_data) {
-                    size_t take = sizeof(prefix) - prefix_len;
-                    if (take > n) {
-                        take = n;
-                    }
-                    memcpy(prefix + prefix_len, p, take);
-                    prefix_len += take;
-                    long used = wav_prefix(prefix, prefix_len, &sink);
-                    if (used == -1) {
-                        if (take < n) {
-                            ok = false;   /* header alone filled the prefix */
-                        }
-                        continue;
-                    }
-                    if (used < 0) {
-                        ok = false;
-                        break;
-                    }
-                    in_data = true;
-                    /* PCM that arrived with the header, then this read's
-                     * bytes beyond what the prefix copied. */
-                    if (!sink_bytes(gen, &sink, prefix + used, prefix_len - (size_t)used)) {
-                        ok = false;
-                        break;
-                    }
-                    p += take;
-                    n -= take;
-                    if (!n) {
-                        continue;
-                    }
-                }
-                if (!sink_bytes(gen, &sink, p, n)) {
-                    ok = false;
-                }
-            }
-            if (ok && !in_data) {
-                ok = false;   /* stream ended before any audio */
-            }
-            if (ok) {
-                ok = sink_flush(gen, &sink);
-            }
-        }
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
     }
     free(url);
-    return ok;
+    if (status != 200) {
+        if (status > 0) {
+            ESP_LOGW(TAG, "TTS request failed (status %d)", status);
+        }
+        return false;
+    }
+    if (!ctx.in_data) {
+        return false;   /* stream ended before any audio */
+    }
+    return sink_flush(gen, &ctx.sink);
 }
 
 /* ---- VOICEVOX ---- */
@@ -598,7 +633,7 @@ static bool speak_sentence(uint32_t gen, const char *sentence)
         free(query.data);
         return false;
     }
-    query.data[query.len] = '\0';   /* body_event's growth leaves room via cap */
+    query.data[query.len] = '\0';   /* the collector's growth leaves room via cap */
     cJSON *root = cJSON_Parse((const char *)query.data);
     free(query.data);
     if (!root) {
