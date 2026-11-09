@@ -74,3 +74,4 @@ CONFIG_PM_PROFILING=y
 # Inert until akari_tts_secrets.h is provisioned on the build machine.
 CONFIG_MUSE_AKARI_TTS=y
 CONFIG_MUSE_CJK_FONT=y
+CONFIG_MUSE_CJK_FONT_NOTO=y
