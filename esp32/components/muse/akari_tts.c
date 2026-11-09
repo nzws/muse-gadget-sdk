@@ -52,7 +52,7 @@ static const char *TAG = "akari_tts";
 
 /* The decided voice: VOICEVOX style id and speaking rate. */
 #define AKARI_SPEAKER_ID 17
-#define AKARI_SPEED_SCALE 1.15
+#define AKARI_SPEED_SCALE 1.25
 #define AKARI_RATE 16000   /* what we ask the engine for; the reply rate */
 
 /* Synthesized speech waiting for the session: ~6 s of 16 kHz mono. */
