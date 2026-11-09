@@ -748,7 +748,8 @@ static bool tts_init(void)
     s_pcm = xStreamBufferCreateWithCaps(PCM_BUF_BYTES, 1, MALLOC_CAP_SPIRAM);
     s_jobs = xQueueCreate(1, sizeof(ak_job_t));
     if (!s_pcm || !s_jobs ||
-        xTaskCreate(tts_task, "akari_tts", 8192, NULL, 5, NULL) != pdPASS) {
+        xTaskCreateWithCaps(tts_task, "akari_tts", 32768, NULL, 5, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         ESP_LOGW(TAG, "no memory for the TTS task");
         return false;
     }
