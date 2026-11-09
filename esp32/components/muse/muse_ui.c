@@ -1148,8 +1148,11 @@ static void apply_text_size(void)
 }
 #endif
 
-#define HISTORY_INSET 28      /* the label's clear space at the round screen's sides */
-#define HISTORY_EDGE_PAD 24   /* and above the first / below the last turn */
+#define HISTORY_INSET 48      /* the label's clear space at the round screen's sides */
+#define HISTORY_EDGE_PAD 104  /* above the first / below the last turn: on the 466 px
+                               * round panel (R=233) a 370 px-wide line only fits the
+                               * circle's chord within +/-142 px of the centre, so the
+                               * end pads keep the first and last lines inside it */
 
 /* The history tile's content: one wrapped label in a body that scrolls
  * up and down inside the tile. A vertical drag scrolls the body; a
