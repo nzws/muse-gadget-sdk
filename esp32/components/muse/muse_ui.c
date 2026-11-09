@@ -1338,9 +1338,9 @@ static void update_clock(void)
     }
     muse_power_t p = muse_state_power();
     if (p.battery_pct < 0) {
-        snprintf(buf, sizeof(buf), "%s · %02d", p.usb ? "USB POWER" : "NO BATTERY", tm.tm_sec);
+        snprintf(buf, sizeof(buf), "%s | %02d", p.usb ? "USB POWER" : "NO BATTERY", tm.tm_sec);
     } else {
-        snprintf(buf, sizeof(buf), "%s %d%% · %02d", p.charging ? "CHARGING" : "BATTERY",
+        snprintf(buf, sizeof(buf), "%s %d%% | %02d", p.charging ? "CHARGING" : "BATTERY",
                  p.battery_pct, tm.tm_sec);
     }
     lv_label_set_text(s_clock_sub, buf);
