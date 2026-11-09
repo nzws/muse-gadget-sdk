@@ -607,10 +607,50 @@ static bool stream_synthesis(uint32_t gen, const char *payload)
 
 /* ---- VOICEVOX ---- */
 
+/*
+ * Reading fix: VOICEVOX's analyzer does not know the name "nejiwa" and
+ * reads the honorific after it as "you" (nejiwa-you) instead of "sama".
+ * Rewrite that one name + honorific into kana in the synthesis input so
+ * it is read "nejiwa-sama". The on-screen text is untouched; only what
+ * is sent to the engine changes. Returns a PSRAM copy (free with free()).
+ */
+static char *fix_reading(const char *sentence)
+{
+    static const char needle[] = "ã­ããæ§";  /* nejiwa + sama(kanji) */
+    static const char kana[] = "ã­ãããã¾";  /* nejiwa-sama in kana */
+    const size_t nlen = sizeof(needle) - 1, klen = sizeof(kana) - 1;
+    size_t count = 0;
+    for (const char *p = sentence; (p = strstr(p, needle)) != NULL; p += nlen) {
+        count++;
+    }
+    size_t len = strlen(sentence);
+    char *out = psram_malloc(len + count * (klen - nlen) + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *dst = out;
+    const char *p = sentence, *hit;
+    while ((hit = strstr(p, needle)) != NULL) {
+        size_t head = (size_t)(hit - p);
+        memcpy(dst, p, head);
+        dst += head;
+        memcpy(dst, kana, klen);
+        dst += klen;
+        p = hit + nlen;
+    }
+    strcpy(dst, p);
+    return out;
+}
+
 /* Synthesizes one sentence and queues its speech. */
 static bool speak_sentence(uint32_t gen, const char *sentence)
 {
-    char *enc = url_encode(sentence);
+    char *fixed = fix_reading(sentence);
+    if (!fixed) {
+        return false;
+    }
+    char *enc = url_encode(fixed);
+    free(fixed);
     if (!enc) {
         return false;
     }
