@@ -25,9 +25,15 @@
  *                    the firmware appends /audio_query and /streaming_synthesis.
  *   AKARI_TTS_TOKEN  Bearer token the endpoint expects, sent as the
  *                    Authorization header of every request.
+ *   AKARI_PAGE_URL   The dynamic page's JSON document, HTTPS; fetched by
+ *                    akari_page.c with the same Bearer token.
+ *   AKARI_HOOK_URL   The dynamic page's action webhook, HTTPS; button
+ *                    actions are POSTed to it as JSON.
  */
 
 #pragma once
 
 #define AKARI_TTS_URL ""
 #define AKARI_TTS_TOKEN ""
+#define AKARI_PAGE_URL ""
+#define AKARI_HOOK_URL ""

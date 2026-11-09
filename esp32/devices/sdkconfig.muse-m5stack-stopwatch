@@ -75,3 +75,8 @@ CONFIG_PM_PROFILING=y
 CONFIG_MUSE_AKARI_TTS=y
 CONFIG_MUSE_CJK_FONT=y
 CONFIG_MUSE_CJK_FONT_NOTO=y
+# The clock page: sdkconfig.muse stops at Montserrat 28, and lwIP's SNTP
+# is built for a single server (esp_netif_sntp's config struct is sized
+# by it); the page wants big digits and two servers.
+CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LWIP_SNTP_MAX_SERVERS=2

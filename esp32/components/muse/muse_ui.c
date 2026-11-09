@@ -20,10 +20,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "lvgl.h"
@@ -32,6 +34,7 @@
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
 #include "akari_history.h"
+#include "akari_page.h"
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_input.h"
@@ -112,14 +115,42 @@ static bool s_touch_talk_down;
  * read from any task (single word, benign if briefly stale). */
 static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
-/* Akari history page: a tile between the face and Settings where the
+/* Akari history page: the tile after the dynamic page, where the
  * finished turns can be read back (akari_history.c keeps them). */
 static lv_obj_t *s_history;
 static lv_obj_t *s_history_scroll;   /* the page's vertically scrolling body */
 static lv_obj_t *s_history_lbl;      /* its one wrapped label */
 static unsigned s_history_seen;      /* akari_history_version() as last rendered */
 
+/* Akari clock page: a tile between the face and the dynamic page. */
+static lv_obj_t *s_clock;
+static lv_obj_t *s_clock_arc;      /* the seconds ring, in Akari red */
+static lv_obj_t *s_clock_time;     /* HH:MM, as large as the fonts allow */
+static lv_obj_t *s_clock_date;     /* 2026年11月9日（日） */
+static lv_obj_t *s_clock_sub;      /* battery and seconds, small */
+static int s_clock_shown_tod = -1;   /* time of day (s) last drawn; -1: the unsynced placeholder */
+
+/* Akari dynamic page (akari_page.c): a tile between the clock and the
+ * history whose blocks are fetched as JSON and rebuilt on change. */
+static lv_obj_t *s_dynamic;
+static lv_obj_t *s_dynamic_scroll;   /* the page's vertically scrolling body */
+static lv_obj_t *s_dynamic_toast;
+static lv_obj_t *s_dynamic_toast_lbl;
+static unsigned s_dynamic_seen;      /* akari_page_version() as last rendered */
+static akari_page_model_t *s_page_ui_model;   /* the model copy on screen; button entries point into it */
+static char s_page_arm_id[AKARI_PAGE_ID_MAX];   /* a confirm button armed by a first tap */
+static float s_page_arm_until;                  /* ... and the seconds it stays armed */
+static char s_page_toast_shown[128];            /* the toast text now on screen, "" for none */
+
+typedef struct {
+    const akari_button_t *btn;   /* into s_page_ui_model */
+    lv_obj_t *lbl;               /* the button's label, for the armed text */
+} page_btn_ui_t;
+static page_btn_ui_t s_page_btns[AKARI_PAGE_MAX_BLOCKS * 2];
+static int s_page_btn_count;
+
 static void refresh_history(void);
+static void refresh_dynamic(void);
 
 static void update_tileview_swipe(void)
 {
@@ -133,8 +164,15 @@ static void update_tileview_swipe(void)
 static void tile_changed_cb(lv_event_t *e)
 {
     lv_obj_t *tv = lv_event_get_target(e);
-    s_face_active = (lv_tileview_get_tile_active(tv) == s_face);
-    if (s_history && lv_tileview_get_tile_active(tv) == s_history) {
+    lv_obj_t *active = lv_tileview_get_tile_active(tv);
+    s_face_active = (active == s_face);
+    if (s_dynamic) {
+        akari_page_set_active(active == s_dynamic);   /* arriving fetches the page */
+        if (active == s_dynamic) {
+            refresh_dynamic();   /* the last good page, while it loads */
+        }
+    }
+    if (s_history && active == s_history) {
         refresh_history();   /* show the turns as they now stand */
     }
 }
@@ -160,7 +198,7 @@ bool muse_ui_face_active(void)
     return s_face_active;
 }
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[3];
+static lv_obj_t *s_dots[5];
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -1185,6 +1223,343 @@ static void build_history_page(void)
     refresh_history();
 }
 
+
+/* ---- Akari clock page ---- */
+
+/*
+ * Wall-clock time: nothing else in the firmware keeps it, so the clock
+ * page starts SNTP once Wi-Fi is up (the usual public pair of servers)
+ * and fixes the timezone to JST. Until the first sync lands the page
+ * shows --:--.
+ */
+static bool s_sntp_started;
+
+static void clock_time_maintain(void)
+{
+    if (s_sntp_started || !muse_wifi_connected()) {
+        return;
+    }
+    setenv("TZ", "JST-9", 1);
+    tzset();
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        2, ESP_SNTP_SERVER_LIST("pool.ntp.org", "ntp.nict.jp"));
+    if (esp_netif_sntp_init(&cfg) == ESP_OK) {
+        s_sntp_started = true;
+        ESP_LOGI(TAG, "clock: SNTP started");
+    }
+}
+
+#if LV_FONT_MONTSERRAT_48
+#define CLOCK_FONT (&lv_font_montserrat_48)
+#define CLOCK_SCALE 448   /* 1.75x: digits about 84 px tall */
+#else
+#define CLOCK_FONT (&lv_font_montserrat_28)
+#define CLOCK_SCALE 768   /* 3x the largest font this build has */
+#endif
+
+static void build_clock_page(void)
+{
+    lv_obj_set_scrollbar_mode(s_clock, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_color(s_clock, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_clock, LV_OPA_COVER, 0);
+
+    /* The seconds as a thin red ring just inside the bezel. */
+    int d = (s_w < s_h ? s_w : s_h) - 20;
+    s_clock_arc = lv_arc_create(s_clock);
+    lv_obj_set_size(s_clock_arc, d, d);
+    lv_obj_center(s_clock_arc);
+    lv_arc_set_bg_angles(s_clock_arc, 0, 360);
+    lv_arc_set_rotation(s_clock_arc, 270);
+    lv_arc_set_range(s_clock_arc, 0, 60);
+    lv_arc_set_value(s_clock_arc, 0);
+    lv_obj_remove_style(s_clock_arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_clock_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_clock_arc, 4, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_clock_arc, lv_color_hex(0x2a1420), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_clock_arc, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_clock_arc, lv_color_hex(0xd92338), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_clock_arc, true, LV_PART_INDICATOR);
+
+    /* The time itself, scaled up around its own centre so the layout
+     * box (and with it the centring) stays the font's. */
+    s_clock_time = make_label(s_clock, CLOCK_FONT, 0xffffff);
+    lv_obj_set_style_transform_pivot_x(s_clock_time, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_clock_time, lv_pct(50), 0);
+    lv_obj_set_style_transform_scale_x(s_clock_time, CLOCK_SCALE, 0);
+    lv_obj_set_style_transform_scale_y(s_clock_time, CLOCK_SCALE, 0);
+    lv_obj_align(s_clock_time, LV_ALIGN_CENTER, 0, -58);
+    lv_label_set_text(s_clock_time, "--:--");
+
+    s_clock_date = make_label(s_clock, caption_font(), COLOR_LIT);
+    lv_obj_align(s_clock_date, LV_ALIGN_CENTER, 0, 38);
+
+    s_clock_sub = make_label(s_clock, &lv_font_unscii_16, COLOR_DIM);
+    lv_obj_set_style_text_letter_space(s_clock_sub, 2, 0);
+    lv_obj_align(s_clock_sub, LV_ALIGN_CENTER, 0, 70);
+}
+
+/* Redraws the clock for the current second; only called while the
+ * clock tile is visible, from update_chrome(). */
+static void update_clock(void)
+{
+    if (!s_clock_time) {
+        return;
+    }
+    time_t t = time(NULL);
+    if (t < 1700000000) {   /* the epoch: SNTP has not landed yet */
+        if (s_clock_shown_tod != -1) {
+            s_clock_shown_tod = -1;
+            lv_label_set_text(s_clock_time, "--:--");
+            lv_label_set_text(s_clock_date, "時刻同期中…");
+            lv_label_set_text(s_clock_sub, "");
+            lv_arc_set_value(s_clock_arc, 0);
+        }
+        return;
+    }
+    struct tm tm;
+    localtime_r(&t, &tm);
+    int tod = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    if (tod == s_clock_shown_tod) {
+        return;   /* this second is already drawn */
+    }
+    s_clock_shown_tod = tod;
+
+    char buf[48];
+    /* The colon blinks: lit on even seconds. */
+    snprintf(buf, sizeof(buf), "%02d%c%02d", tm.tm_hour, tm.tm_sec % 2 ? ' ' : ':', tm.tm_min);
+    lv_label_set_text(s_clock_time, buf);
+    lv_arc_set_value(s_clock_arc, tm.tm_sec);
+
+    static const char *const WDAY[7] = { "日", "月", "火", "水", "木", "金", "土" };
+    snprintf(buf, sizeof(buf), "%d年%d月%d日（%s）", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             WDAY[tm.tm_wday]);
+    if (strcmp(buf, lv_label_get_text(s_clock_date)) != 0) {
+        lv_label_set_text(s_clock_date, buf);
+    }
+    muse_power_t p = muse_state_power();
+    if (p.battery_pct < 0) {
+        snprintf(buf, sizeof(buf), "%s · %02d", p.usb ? "USB POWER" : "NO BATTERY", tm.tm_sec);
+    } else {
+        snprintf(buf, sizeof(buf), "%s %d%% · %02d", p.charging ? "CHARGING" : "BATTERY",
+                 p.battery_pct, tm.tm_sec);
+    }
+    lv_label_set_text(s_clock_sub, buf);
+}
+
+/* ---- Akari dynamic page ---- */
+
+/* A title in Montserrat 20 when it is Latin; CJK only has the 16 px
+ * caption font, which is also the honest size for mixed text. */
+static const lv_font_t *page_title_font(const char *text)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_text_has_cjk(text)) {
+        return caption_font();
+    }
+#endif
+    (void)text;
+    return &lv_font_montserrat_20;
+}
+
+static void on_page_button(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_page_btn_count) {
+        return;
+    }
+    const akari_button_t *b = s_page_btns[idx].btn;
+    float now = (float)esp_timer_get_time() / 1e6f;
+    if (b->confirm && (strcmp(s_page_arm_id, b->id) != 0 || now > s_page_arm_until)) {
+        /* The first tap only arms it, and says so on the button. */
+        strlcpy(s_page_arm_id, b->id, sizeof(s_page_arm_id));
+        s_page_arm_until = now + 3.0f;
+        lv_label_set_text(s_page_btns[idx].lbl, "もう一度タップで実行");
+        return;
+    }
+    s_page_arm_id[0] = '\0';
+    lv_label_set_text(s_page_btns[idx].lbl, b->label);
+    akari_page_action(b->id, "tap");
+}
+
+static lv_obj_t *page_make_button(lv_obj_t *parent, const akari_button_t *b, int width)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, width, 60);
+    lv_obj_set_style_radius(btn, 16, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(b->danger ? 0xd92338 : 0x2a2145), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *lbl = make_label(btn, caption_font(), 0xffffff);
+    lv_obj_set_width(lbl, width - 20);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(lbl, b->label);
+    lv_obj_center(lbl);
+    if (s_page_btn_count < (int)(sizeof(s_page_btns) / sizeof(s_page_btns[0]))) {
+        int idx = s_page_btn_count++;
+        s_page_btns[idx].btn = b;
+        s_page_btns[idx].lbl = lbl;
+        lv_obj_add_event_cb(btn, on_page_button, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    }
+    return btn;
+}
+
+/* The dynamic tile's content: a column of blocks in a body that scrolls
+ * like the history page's, with the same round-screen insets. Buttons
+ * are rebuilt with the blocks; their entries point into the model copy
+ * the page is showing (s_page_ui_model), which is freed only after the
+ * old blocks are gone. */
+static void build_dynamic_page(void)
+{
+    lv_obj_set_scrollbar_mode(s_dynamic, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_color(s_dynamic, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_dynamic, LV_OPA_COVER, 0);
+
+    s_dynamic_scroll = lv_obj_create(s_dynamic);
+    lv_obj_remove_style_all(s_dynamic_scroll);
+    lv_obj_set_size(s_dynamic_scroll, lv_pct(100), lv_pct(100));
+    lv_obj_set_scroll_dir(s_dynamic_scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_dynamic_scroll, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_left(s_dynamic_scroll, HISTORY_INSET, 0);
+    lv_obj_set_style_pad_right(s_dynamic_scroll, HISTORY_INSET, 0);
+    lv_obj_set_style_pad_top(s_dynamic_scroll, HISTORY_EDGE_PAD, 0);
+    lv_obj_set_style_pad_bottom(s_dynamic_scroll, HISTORY_EDGE_PAD, 0);
+    lv_obj_set_flex_flow(s_dynamic_scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_dynamic_scroll, 10, 0);
+
+    /* The webhook's toast: a pill pinned over the top of the page. */
+    s_dynamic_toast = lv_obj_create(s_dynamic);
+    lv_obj_remove_style_all(s_dynamic_toast);
+    lv_obj_set_size(s_dynamic_toast, s_w - 2 * HISTORY_INSET, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_dynamic_toast, lv_color_hex(0x2a2145), 0);
+    lv_obj_set_style_bg_opa(s_dynamic_toast, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_dynamic_toast, 16, 0);
+    lv_obj_set_style_pad_hor(s_dynamic_toast, 14, 0);
+    lv_obj_set_style_pad_ver(s_dynamic_toast, 7, 0);
+    lv_obj_remove_flag(s_dynamic_toast, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_dynamic_toast, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(s_dynamic_toast, LV_ALIGN_TOP_MID, 0, 46);
+    s_dynamic_toast_lbl = make_label(s_dynamic_toast, caption_font(), COLOR_LIT);
+    lv_obj_set_width(s_dynamic_toast_lbl, s_w - 2 * HISTORY_INSET - 28);
+    lv_label_set_long_mode(s_dynamic_toast_lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_center(s_dynamic_toast_lbl);
+    lv_obj_add_flag(s_dynamic_toast, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Rebuilds the dynamic page's blocks from akari_page's model and
+ * shows its top. Only the LVGL task calls this. */
+static void refresh_dynamic(void)
+{
+    if (!s_dynamic_scroll) {
+        return;
+    }
+    akari_page_model_t *m = akari_page_get();
+    lv_obj_clean(s_dynamic_scroll);
+    s_page_btn_count = 0;
+    s_page_arm_id[0] = '\0';
+    free(s_page_ui_model);
+    s_page_ui_model = m;
+    s_dynamic_seen = akari_page_version();
+
+    int w = s_w - 2 * HISTORY_INSET;
+    if (!m) {
+        lv_obj_t *l = make_label(s_dynamic_scroll, caption_font(), COLOR_DIM);
+        lv_obj_set_width(l, w);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+        lv_label_set_text(l, akari_page_failed() ? "ページを読み込めませんでした" : "読み込み中…");
+        return;
+    }
+    if (m->title[0]) {
+        lv_obj_t *l = make_label(s_dynamic_scroll, page_title_font(m->title), COLOR_LIT);
+        lv_obj_set_width(l, w);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+        lv_label_set_text(l, m->title);
+    }
+    for (int i = 0; i < m->n_blocks; i++) {
+        const akari_block_t *b = &m->blocks[i];
+        switch (b->kind) {
+        case AKB_TITLE: {
+            lv_obj_t *l = make_label(s_dynamic_scroll, page_title_font(b->text), COLOR_LIT);
+            lv_obj_set_width(l, w);
+            lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_LEFT, 0);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+            lv_label_set_text(l, b->text);
+            break;
+        }
+        case AKB_TEXT:
+        case AKB_CAPTION: {
+            lv_obj_t *l = make_label(s_dynamic_scroll, caption_font(),
+                                     b->kind == AKB_TEXT ? COLOR_LIT : COLOR_DIM);
+            lv_obj_set_width(l, w);
+            lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_LEFT, 0);
+            lv_obj_set_style_text_line_space(l, 4, 0);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+            lv_label_set_text(l, b->text);
+            break;
+        }
+        case AKB_DIVIDER: {
+            lv_obj_t *l = lv_obj_create(s_dynamic_scroll);
+            lv_obj_remove_style_all(l);
+            lv_obj_set_size(l, w, 2);
+            lv_obj_set_style_bg_color(l, lv_color_hex(COLOR_DOT_OFF), 0);
+            lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
+            lv_obj_remove_flag(l, LV_OBJ_FLAG_SCROLLABLE);
+            break;
+        }
+        case AKB_SPACER: {
+            lv_obj_t *l = lv_obj_create(s_dynamic_scroll);
+            lv_obj_remove_style_all(l);
+            lv_obj_set_size(l, 1, b->spacer_h);
+            lv_obj_remove_flag(l, LV_OBJ_FLAG_SCROLLABLE);
+            break;
+        }
+        case AKB_BUTTON:
+            page_make_button(s_dynamic_scroll, &b->btn[0], w);
+            break;
+        case AKB_BUTTON_ROW: {
+            if (b->n_btn < 2) {
+                page_make_button(s_dynamic_scroll, &b->btn[0], w);
+                break;
+            }
+            lv_obj_t *row = lv_obj_create(s_dynamic_scroll);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, w, 60);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_style_pad_column(row, 10, 0);
+            int half = (w - 10) / 2;
+            page_make_button(row, &b->btn[0], half);
+            page_make_button(row, &b->btn[1], half);
+            break;
+        }
+        }
+    }
+    lv_obj_scroll_to_y(s_dynamic_scroll, 0, LV_ANIM_OFF);
+}
+
+/* While the dynamic page is up: follow the model's version, an armed
+ * confirm button's expiry, and the toast. From update_chrome(). */
+static void update_dynamic(float now)
+{
+    if (akari_page_version() != s_dynamic_seen) {
+        refresh_dynamic();
+    }
+    if (s_page_arm_id[0] && now > s_page_arm_until) {
+        s_page_arm_id[0] = '\0';
+        refresh_dynamic();   /* puts the button's own label back */
+    }
+    char toast[128];
+    bool live = akari_page_toast(toast, sizeof(toast));
+    if (live && strcmp(toast, s_page_toast_shown) != 0) {
+        strlcpy(s_page_toast_shown, toast, sizeof(s_page_toast_shown));
+        lv_label_set_text(s_dynamic_toast_lbl, toast);
+        lv_obj_remove_flag(s_dynamic_toast, LV_OBJ_FLAG_HIDDEN);
+    } else if (!live && s_page_toast_shown[0]) {
+        s_page_toast_shown[0] = '\0';
+        lv_obj_add_flag(s_dynamic_toast, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void build_screen(void)
 {
 #if CONFIG_MUSE_LATIN_FONT
@@ -1210,9 +1585,13 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
-        s_history = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-        s_settings = lv_tileview_add_tile(s_tv, 2, 0, LV_DIR_LEFT);
+        s_clock = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+        s_dynamic = lv_tileview_add_tile(s_tv, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+        s_history = lv_tileview_add_tile(s_tv, 3, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+        s_settings = lv_tileview_add_tile(s_tv, 4, 0, LV_DIR_LEFT);
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        build_clock_page();
+        build_dynamic_page();
         build_history_page();
         face = s_face;
     }
@@ -1549,7 +1928,7 @@ static void build_overlays(void)
     lv_obj_t *scr = lv_screen_active();
 
     /* Page dots. */
-    for (int i = 0; i < 3 && s_tv; i++) {
+    for (int i = 0; i < 5 && s_tv; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1557,7 +1936,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (i - 1) * 16, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (i - 2) * 16, -14);
         s_dots[i] = d;
     }
 
@@ -1727,23 +2106,32 @@ static void update_chrome(float now)
     }
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
+    clock_time_maintain();
+
     if (s_tv) {
         lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
-        int page = active == s_settings ? 2 : active == s_history ? 1 : 0;
+        int page = active == s_settings ? 4 : active == s_history ? 3 : active == s_dynamic ? 2
+                   : active == s_clock ? 1 : 0;
         bool subpage = muse_settings_ui_in_subpage();
-        s_swipe_enabled = page != 2 || !subpage;
+        s_swipe_enabled = page != 4 || !subpage;
         update_tileview_swipe();
         int shown = page * 2 + subpage;
         if (shown != s_shown_page) {
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 5; i++) {
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page == 2 && subpage);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page == 4 && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(page == 2);
-        if (page == 1 && akari_history_version() != s_history_seen) {
+        muse_settings_ui_tick(page == 4);
+        if (page == 3 && akari_history_version() != s_history_seen) {
             refresh_history();   /* a turn finished while the page is up */
+        }
+        if (page == 2) {
+            update_dynamic(now);
+        }
+        if (page == 1) {
+            update_clock();
         }
     }
 

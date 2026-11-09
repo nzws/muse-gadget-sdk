@@ -36,6 +36,14 @@
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
+#if CONFIG_MUSE_AKARI_TTS
+#include "akari_page.h"   /* the dynamic page's physical key bindings */
+#define page_key(k) akari_page_key(k)
+#define page_key_bound(k) akari_page_key_bound(k)
+#else
+#define page_key(k) (false)
+#define page_key_bound(k) (false)
+#endif
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
@@ -314,16 +322,21 @@ static void talk_button(unsigned ev)
             swallow = true;
         } else if (muse_state_asleep()) {
             set_asleep(false, muse_board->talk_button);
-            if (voice) {
+            if (voice && !page_key_bound(AKARI_PAGE_KEY_TALK)) {
                 post(MUSE_PTT_DOWN, true);
                 talk_down = true;
             } else {
+                /* Wake only. With the dynamic page's talk binding live a
+                 * waking press must not also start a voice turn, and a
+                 * press nobody can see must not fire the binding either. */
                 swallow = true;
             }
         } else if (muse_menu_is_open()) {
             muse_state_poke();
             if (!muse_board->keyboard) muse_menu_key(MUSE_MENU_SELECT);
             swallow = true;
+        } else if (page_key(AKARI_PAGE_KEY_TALK)) {
+            swallow = true;   /* the dynamic page's binding took the press */
         } else if (voice) {
             post(MUSE_PTT_DOWN, false);
             talk_down = true;
@@ -638,6 +651,8 @@ static void dedicated_buttons(unsigned ev)
         muse_state_poke();
         if (muse_state_asleep()) {
             set_asleep(false, muse_board->speaker_button);   /* wake-only press */
+        } else if (page_key(AKARI_PAGE_KEY_FN)) {
+            /* the dynamic page's binding took the press: no speaker toggle */
         } else if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
             bool on = !muse_settings_speaker_on();
             muse_settings_set_speaker_on(on);
