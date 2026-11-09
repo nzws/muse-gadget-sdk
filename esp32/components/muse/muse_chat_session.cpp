@@ -1212,6 +1212,11 @@ static bool record_note(void)
         return false;
     }
     ESP_LOGI(TAG, "voice note: %.2fs, %u byte request", secs, (unsigned)s_turn.body_sent);
+    {
+        char heard_note[32];
+        snprintf(heard_note, sizeof(heard_note), "（音声 %.0f秒）", (double)secs);
+        akari_history_add(true, heard_note);   /* voice notes carry no transcript back to the watch */
+    }
     mark(M_SENT);
     s_turn.chat_posted = true;
     s_turn.chat_us = s_turn.last_event_us = now_us();

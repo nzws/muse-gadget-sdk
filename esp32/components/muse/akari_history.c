@@ -110,7 +110,7 @@ unsigned akari_history_version(void)
 
 char *akari_history_render(void)
 {
-    static const char USER_HEAD[] = "ねじわ様：";
+    static const char USER_HEAD[] = "自分：";
     static const char AKARI_HEAD[] = "朱莉：";
     if (!history_init()) {
         return NULL;
